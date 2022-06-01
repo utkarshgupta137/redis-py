@@ -1,15 +1,19 @@
 import asyncio
 import collections
+import inspect
 import random
 import socket
 import warnings
 from typing import (
     Any,
+    Awaitable,
+    Callable,
     Deque,
     Dict,
     Generator,
     List,
     Mapping,
+    NoReturn,
     Optional,
     Type,
     TypeVar,
@@ -49,6 +53,7 @@ from redis.exceptions import (
     SlotNotCoveredError,
     TimeoutError,
     TryAgainError,
+    WatchError,
 )
 from redis.typing import AnyKeyT, EncodableT, KeyT
 from redis.utils import dict_merge, safe_str, str_if_bytes
@@ -729,22 +734,72 @@ class RedisCluster(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterCommand
         raise ClusterError("TTL exhausted.")
 
     def pipeline(
-        self, transaction: Optional[Any] = None, shard_hint: Optional[Any] = None
+        self, shard_hint: Optional[str] = None, transaction: bool = False
     ) -> "ClusterPipeline":
         """
         Create & return a new :class:`~.ClusterPipeline` object.
 
-        Cluster implementation of pipeline does not support transaction or shard_hint.
-
-        :raises RedisClusterException: if transaction or shard_hint are truthy values
+        :param shard_hint:
+            | If it is equal to :attr:`MULTI_TRANSACTION`, then commands mapped to each
+              cluster will be sent as individual transactions.
+            |
+              Otherwise, all commands will be sent to the shard mapped by this key.
+        :param transaction:
+            | Whether the pipeline should execute as a transaction.
         """
-        if shard_hint:
-            raise RedisClusterException("shard_hint is deprecated in cluster mode")
+        multi_transaction = False
+        if shard_hint == self.__class__.MULTI_TRANSACTION:
+            shard_hint = None
+            transaction = True
+            multi_transaction = True
 
-        if transaction:
-            raise RedisClusterException("transaction is deprecated in cluster mode")
+        return ClusterPipeline(self, shard_hint, transaction, multi_transaction)
 
-        return ClusterPipeline(self)
+    async def transaction(
+        self,
+        func: Callable[["ClusterPipeline"], Union[Any, Awaitable[Any]]],
+        *watch: KeyT,
+        shard_hint: Optional[str] = None,
+        value_from_callable: bool = False,
+        watch_delay: Optional[float] = None,
+    ) -> Any:
+        """
+        Execute a transaction by calling the provided `func` with a pipeline object.
+
+        :param func:
+            | Any sync or async function which when called with a
+              :class:`~.ClusterPipeline` object adds required commands to it
+        :param *watch:
+            | Keys to watch. All commands should map to the same node
+        :param shard_hint:
+            | See :meth:`execute`
+        :param value_from_callable:
+            | If true, returns the return value from function
+        :param watch_delay:
+            | Time (in seconds) to sleep if :class:`.WatchError` is raised
+
+        :raises WatchError: If watch_delay is `None` & :class:`.WatchError` is raised.
+        """
+        while True:
+            if watch:
+                await self.execute_command("WATCH", *watch)
+
+            try:
+                async with self.pipeline(shard_hint, True) as pipe:
+                    func_value = func(pipe)
+                    if inspect.isawaitable(func_value):
+                        func_value = await func_value
+
+                    exec_value = await pipe.execute()
+
+                    return func_value if value_from_callable else exec_value
+            except WatchError:
+                if watch_delay:
+                    await asyncio.sleep(watch_delay)
+            except BaseException:
+                if watch:
+                    await self.execute_command("UNWATCH", *watch)
+                raise
 
 
 class ClusterNode:
@@ -1235,10 +1290,25 @@ class ClusterPipeline(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterComm
         | Existing :class:`~.RedisCluster` client
     """
 
-    __slots__ = ("_command_stack", "_client")
+    __slots__ = (
+        "_client",
+        "_command_stack",
+        "_multi_transaction",
+        "_shard_hint",
+        "_transaction",
+    )
 
-    def __init__(self, client: RedisCluster) -> None:
+    def __init__(
+        self,
+        client: RedisCluster,
+        shard_hint: Optional[str] = None,
+        transaction: bool = False,
+        multi_transaction: bool = False,
+    ) -> None:
         self._client = client
+        self._shard_hint = shard_hint
+        self._transaction = transaction
+        self._multi_transaction = multi_transaction
 
         self._command_stack: List["PipelineCommand"] = []
 
@@ -1293,10 +1363,12 @@ class ClusterPipeline(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterComm
         self, raise_on_error: bool = True, allow_redirections: bool = True
     ) -> List[Any]:
         """
-        Execute the pipeline.
+        Execute the pipeline/transaction.
 
-        It will retry the commands as specified by :attr:`cluster_error_retry_attempts`
-        & then raise an exception.
+        It will retry the pipeline as specified by :attr:`cluster_error_retry_attempts`
+        & then raise an exception. If it is a transaction, then it is not retried.
+
+        `raise_on_error` & `allow_redirections` are ignored for transactions.
 
         :param raise_on_error:
             | Raise the first error if there are any errors
@@ -1304,43 +1376,60 @@ class ClusterPipeline(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterComm
             | Whether to retry each failed command individually in case of redirection
               errors
 
-        :raises RedisClusterException: if target_nodes is not provided & the command
-            can't be mapped to a slot
+        :raises RedisClusterException: if target_nodes & shard_hint are not provided &
+            the command can't be mapped to a slot
         """
         if not self._command_stack:
             return []
 
+        target_node = None
         try:
             for _ in range(self._client.cluster_error_retry_attempts):
                 if self._client._initialize:
                     await self._client.initialize()
+                if self._shard_hint:
+                    target_node = self._client.get_node_from_key(self._shard_hint)
 
                 try:
-                    return await self._execute(
-                        self._client,
-                        self._command_stack,
-                        raise_on_error=raise_on_error,
-                        allow_redirections=allow_redirections,
-                    )
+                    if self._multi_transaction:
+                        return await self._execute_multi_transaction(
+                            self._client, self._command_stack, target_node
+                        )
+                    elif self._transaction:
+                        return await self._execute_transaction(
+                            self._client, self._command_stack, target_node
+                        )
+                    else:
+                        return await self._execute_pipeline(
+                            self._client,
+                            self._command_stack,
+                            target_node,
+                            raise_on_error=raise_on_error,
+                            allow_redirections=allow_redirections,
+                        )
                 except BaseException as e:
-                    if type(e) in self.__class__.ERRORS_ALLOW_RETRY:
+                    if (
+                        not self._transaction
+                        and type(e) in self.__class__.ERRORS_ALLOW_RETRY
+                    ):
                         # Try again with the new cluster setup.
                         exception = e
                         await self._client.close()
                         await asyncio.sleep(0.25)
                     else:
                         # All other errors should be raised.
-                        raise e
+                        raise
 
             # If it fails the configured number of times then raise an exception
             raise exception
         finally:
             self._command_stack = []
 
-    async def _execute(
+    async def _execute_pipeline(
         self,
         client: "RedisCluster",
         stack: List["PipelineCommand"],
+        target_node: Optional["ClusterNode"] = None,
         raise_on_error: bool = True,
         allow_redirections: bool = True,
     ) -> List[Any]:
@@ -1348,25 +1437,34 @@ class ClusterPipeline(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterComm
             cmd for cmd in stack if not cmd.result or isinstance(cmd.result, Exception)
         ]
 
-        nodes = {}
-        for cmd in todo:
-            target_nodes = await client._determine_nodes(*cmd.args)
-            if not target_nodes:
-                raise RedisClusterException(
-                    f"No targets were found to execute {cmd.args} command on"
+        if target_node:
+            target_node._command_stack = todo
+            errors = [await target_node.execute_pipeline()]
+        else:
+            nodes = {}
+            for cmd in todo:
+                target_nodes = await client._determine_nodes(*cmd.args)
+                if not target_nodes:
+                    raise RedisClusterException(
+                        f"No targets were found to execute {cmd.args} command on"
+                    )
+                if len(target_nodes) > 1:
+                    raise RedisClusterException(
+                        f"Too many targets for command {cmd.args}"
+                    )
+
+                node = target_nodes[0]
+                if node.name not in nodes:
+                    nodes[node.name] = node
+                    node._command_stack = []
+                node._command_stack.append(cmd)
+
+            errors = await asyncio.gather(
+                *(
+                    asyncio.ensure_future(node.execute_pipeline())
+                    for node in nodes.values()
                 )
-            if len(target_nodes) > 1:
-                raise RedisClusterException(f"Too many targets for command {cmd.args}")
-
-            node = target_nodes[0]
-            if node.name not in nodes:
-                nodes[node.name] = node
-                node._command_stack = []
-            node._command_stack.append(cmd)
-
-        errors = await asyncio.gather(
-            *(asyncio.ensure_future(node.execute_pipeline()) for node in nodes.values())
-        )
+            )
 
         if any(errors):
             if allow_redirections:
@@ -1394,6 +1492,86 @@ class ClusterPipeline(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterComm
 
         return [cmd.result for cmd in stack]
 
+    async def _execute_transaction(
+        self,
+        client: "RedisCluster",
+        stack: List["PipelineCommand"],
+        target_node: Optional["ClusterNode"] = None,
+    ) -> List[Any]:
+        todo = [
+            cmd for cmd in stack if not cmd.result or isinstance(cmd.result, Exception)
+        ]
+
+        if target_node:
+            target_node._command_stack = todo
+        else:
+            for cmd in todo:
+                target_nodes = await client._determine_nodes(*cmd.args)
+                if not target_nodes:
+                    raise RedisClusterException(
+                        f"No targets were found to execute {cmd.args} command on"
+                    )
+                if len(target_nodes) > 1:
+                    raise RedisClusterException(
+                        f"Too many targets for command {cmd.args}"
+                    )
+
+                if target_node:
+                    if target_nodes[0] != target_node:
+                        raise RedisClusterException(
+                            "Multiple targets for transaction & shard_hint != "
+                            "MULTI_TRANSACTION. "
+                        )
+                else:
+                    target_node = target_nodes[0]
+
+                target_node._command_stack.append(cmd)
+
+        await target_node.execute_pipeline()
+
+        return [cmd.result for cmd in stack]
+
+    async def _execute_multi_transaction(
+        self,
+        client: "RedisCluster",
+        stack: List["PipelineCommand"],
+        target_node: Optional["ClusterNode"] = None,
+    ) -> List[Any]:
+        todo = [
+            cmd for cmd in stack if not cmd.result or isinstance(cmd.result, Exception)
+        ]
+
+        if target_node:
+            target_node._command_stack = todo
+            [await target_node.execute_pipeline()]
+        else:
+            nodes = {}
+            for cmd in todo:
+                target_nodes = await client._determine_nodes(*cmd.args)
+                if not target_nodes:
+                    raise RedisClusterException(
+                        f"No targets were found to execute {cmd.args} command on"
+                    )
+                if len(target_nodes) > 1:
+                    raise RedisClusterException(
+                        f"Too many targets for command {cmd.args}"
+                    )
+
+                node = target_nodes[0]
+                if node.name not in nodes:
+                    nodes[node.name] = node
+                    node._command_stack = []
+                node._command_stack.append(cmd)
+
+            await asyncio.gather(
+                *(
+                    asyncio.ensure_future(node.execute_pipeline())
+                    for node in nodes.values()
+                )
+            )
+
+        return [cmd.result for cmd in stack]
+
     def _split_command_across_slots(
         self, command: str, *keys: KeyT
     ) -> "ClusterPipeline":
@@ -1416,6 +1594,23 @@ class ClusterPipeline(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterComm
             self.execute_command("MSET", *pairs)
 
         return self
+
+    def discard(self) -> None:
+        self._command_stack = []
+
+    def multi(self, *args: Any, **kwargs: Any) -> NoReturn:
+        raise NotImplementedError(
+            "Use client.pipeline(transaction=True) or client.transaction()"
+        )
+
+    def exec(self, *args: Any, **kwargs: Any) -> NoReturn:
+        raise NotImplementedError("Use pipeline.execute()")
+
+    def watch(self, *args: Any, **kwargs: Any) -> NoReturn:
+        raise NotImplementedError("Use client.transaction(watches=keys)")
+
+    def unwatch(self, *args: Any, **kwargs: Any) -> NoReturn:
+        raise NotImplementedError("Use client.transaction(watches=keys)")
 
 
 for command in PIPELINE_BLOCKED_COMMANDS:

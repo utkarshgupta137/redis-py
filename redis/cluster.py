@@ -238,6 +238,8 @@ class AbstractRedisCluster:
 
     NODE_FLAGS = {PRIMARIES, REPLICAS, ALL_NODES, RANDOM, DEFAULT_NODE}
 
+    MULTI_TRANSACTION = "multi-transaction"
+
     COMMAND_FLAGS = dict_merge(
         list_keys_to_dict(
             [
