@@ -18,9 +18,8 @@ from _pytest.fixtures import FixtureRequest, SubRequest
 
 from redis.asyncio import Connection, RedisCluster
 from redis.asyncio.cluster import ClusterNode, NodesManager
-from redis.asyncio.parser import CommandsParser
 from redis.cluster import PIPELINE_BLOCKED_COMMANDS, PRIMARY, REPLICA, get_node_name
-from redis.crc import REDIS_CLUSTER_HASH_SLOTS, key_slot
+from redis.commands.slotter import REDIS_CLUSTER_HASH_SLOTS, CommandSlotter
 from redis.exceptions import (
     AskError,
     ClusterDownError,
@@ -99,7 +98,7 @@ async def get_mocked_redis_client(*args, **kwargs) -> RedisCluster:
         execute_command_mock.side_effect = execute_command
 
         with mock.patch.object(
-            CommandsParser, "initialize", autospec=True
+            CommandSlotter, "initialize", autospec=True
         ) as cmd_parser_initialize:
 
             def cmd_init_mock(self, r: ClusterNode) -> None:
@@ -272,8 +271,9 @@ class TestRedisClusterObj:
         """
         with pytest.raises(RedisClusterException) as ex:
             await r.execute_command("GET")
-        assert str(ex.value).startswith(
-            "No way to dispatch this command to " "Redis Cluster. Missing key."
+        assert str(ex.value) == (
+            "Missing key. No way to dispatch ('GET',) to Redis Cluster. "
+            "You can execute the command by specifying target nodes."
         )
 
     async def test_execute_command_node_flag_primaries(self, r: RedisCluster) -> None:
@@ -451,7 +451,7 @@ class TestRedisClusterObj:
                     mocks["send_packed_command"].return_value = "MOCK_OK"
                     mocks["connect"].return_value = None
                     with mock.patch.object(
-                        CommandsParser, "initialize", autospec=True
+                        CommandSlotter, "initialize", autospec=True
                     ) as cmd_parser_initialize:
 
                         def cmd_init_mock(self, r: ClusterNode) -> None:
@@ -1132,7 +1132,7 @@ class TestClusterRedisCommands:
 
     async def test_slowlog_length(self, r: RedisCluster, slowlog: None) -> None:
         await r.get("foo")
-        node = r.nodes_manager.get_node_from_slot(key_slot(b"foo"))
+        node = r.nodes_manager.get_node_from_slot(r.keyslot("foo"))
         slowlog_len = await r.slowlog_len(target_nodes=node)
         assert isinstance(slowlog_len, int)
 
@@ -1158,7 +1158,7 @@ class TestClusterRedisCommands:
         # put a key into the current db to make sure that "db.<current-db>"
         # has data
         await r.set("foo", "bar")
-        node = r.nodes_manager.get_node_from_slot(key_slot(b"foo"))
+        node = r.nodes_manager.get_node_from_slot(r.keyslot("foo"))
         stats = await r.memory_stats(target_nodes=node)
         assert isinstance(stats, dict)
         for key, value in stats.items():
@@ -2207,7 +2207,7 @@ class TestNodesManager:
             assert "Redis Cluster cannot be connected" in str(e.value)
 
             with mock.patch.object(
-                CommandsParser, "initialize", autospec=True
+                CommandSlotter, "initialize", autospec=True
             ) as cmd_parser_initialize:
 
                 def cmd_init_mock(self, r: ClusterNode) -> None:

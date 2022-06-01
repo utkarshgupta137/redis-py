@@ -4,16 +4,19 @@ from .helpers import list_or_args
 from .parser import CommandsParser
 from .redismodules import AsyncRedisModuleCommands, RedisModuleCommands
 from .sentinel import AsyncSentinelCommands, SentinelCommands
+from .slotter import CommandSlotter, KeySlotter
 
 __all__ = [
-    "AsyncRedisClusterCommands",
-    "RedisClusterCommands",
-    "CommandsParser",
     "AsyncCoreCommands",
-    "CoreCommands",
-    "list_or_args",
+    "AsyncRedisClusterCommands",
     "AsyncRedisModuleCommands",
-    "RedisModuleCommands",
     "AsyncSentinelCommands",
+    "CommandSlotter",
+    "CommandsParser",
+    "CoreCommands",
+    "KeySlotter",
+    "RedisClusterCommands",
+    "RedisModuleCommands",
     "SentinelCommands",
+    "list_or_args",
 ]
