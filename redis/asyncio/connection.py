@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import copy
 import enum
@@ -428,6 +430,7 @@ class HiredisParser(BaseParser):
             return await self.read_from_socket(timeout=timeout, raise_on_timeout=False)
         return True
 
+    @profile
     async def read_from_socket(
         self,
         timeout: Union[float, None, _Sentinel] = SENTINEL,
@@ -462,6 +465,7 @@ class HiredisParser(BaseParser):
                 return False
             raise ConnectionError(f"Error while reading from socket: {ex.args}")
 
+    @profile
     async def read_response(
         self, disable_decoding: bool = False
     ) -> Union[EncodableT, List[EncodableT]]:
@@ -629,6 +633,7 @@ class Connection:
             pass
 
     @property
+    @profile
     def is_connected(self):
         return self._reader and self._writer
 
@@ -808,6 +813,7 @@ class Connection:
         self._writer.writelines(command)
         await self._writer.drain()
 
+    @profile
     async def send_packed_command(
         self, command: Union[bytes, str, Iterable[bytes]], check_health: bool = True
     ) -> None:
@@ -900,6 +906,7 @@ class Connection:
             raise response from None
         return response
 
+    @profile
     async def read_response_without_lock(self, disable_decoding: bool = False):
         """Read the response from a previously sent command"""
         try:

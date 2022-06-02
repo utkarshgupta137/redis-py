@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import random
 from binascii import crc_hqx
 from typing import TYPE_CHECKING, Any, Dict, Tuple, Union
@@ -15,7 +17,6 @@ if TYPE_CHECKING:
     from redis.asyncio.cluster import ClusterNode
 
 try:
-    from redis.speedups import CommandSlotter as _CommandSlotter
     from redis.speedups import KeySlotter as _KeySlotter
 
     SPEEDUPS = True
@@ -42,6 +43,7 @@ class KeySlotter:
         if self.speedups:
             self._key_slotter = _KeySlotter(self.encoding, self.errors)
 
+    @profile
     def key_slot(self, key: EncodableT) -> int:
         if self.speedups:
             try:
@@ -63,8 +65,6 @@ class CommandSlotter(KeySlotter):
 
     def __init__(self, encoder: Encoder, speedups: bool = True) -> None:
         super().__init__(encoder, speedups)
-        if self.speedups:
-            self._command_slotter = _CommandSlotter(self.encoding, self.errors)
 
         self.commands: Dict[str, Union[int, Dict[str, Any]]] = {}
 
@@ -81,16 +81,8 @@ class CommandSlotter(KeySlotter):
                 commands[cmd] = 1
         self.commands = {cmd.upper(): command for cmd, command in commands.items()}
 
-        if self.speedups:
-            self._command_slotter.initialize(self.commands)
-
+    @profile
     def command_slot(self, command: str, *args: EncodableT) -> int:
-        if self.speedups:
-            try:
-                return self._command_slotter.command_slot(command, args)
-            except Exception:
-                ...
-
         # get the keys in the command
         keys = self.get_keys(command, *args) if args else ()
 
@@ -118,6 +110,7 @@ class CommandSlotter(KeySlotter):
 
         return slots.pop()
 
+    @profile
     def get_keys(self, command: str, *args: EncodableT) -> Tuple[EncodableT, ...]:
         if command in ("MOVABLE_KEYS", "EVAL", "EVALSHA", "FCALL", "FCALL_RO"):
             # COMMAND GETKEYS is buggy with EVAL/EVALSHA for redis < 7.0

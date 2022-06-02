@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Iterable, List, Tuple
 
 from redis.encoder import Encoder
@@ -39,6 +41,7 @@ class CommandPacker:
         if self.speedups:
             self._command_packer = _CommandPacker(self.encoding, self.errors)
 
+    @profile
     def pack_command(self, *args: EncodableT) -> List[EncodedT]:
         if self.speedups:
             try:
@@ -89,6 +92,7 @@ class CommandPacker:
         output.append(buff)
         return output
 
+    @profile
     def pack_commands(
         self, commands: Iterable[Tuple[EncodableT, ...]]
     ) -> List[EncodedT]:

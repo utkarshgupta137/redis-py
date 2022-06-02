@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import collections
 import random
@@ -472,6 +474,7 @@ class RedisCluster(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterCommand
         """
         return self.key_slotter.key_slot(key)
 
+    @profile
     async def _determine_nodes(
         self, command: str, *args: EncodableT, node_flag: Optional[str] = None
     ) -> List["ClusterNode"]:
@@ -689,6 +692,7 @@ class RedisCluster(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterCommand
 
         raise ClusterError("TTL exhausted.")
 
+    @profile
     def pipeline(
         self, transaction: Optional[Any] = None, shard_hint: Optional[Any] = None
     ) -> "ClusterPipeline":
@@ -796,6 +800,7 @@ class ClusterNode:
         if exc:
             raise exc
 
+    @profile
     def acquire_connection(self) -> Connection:
         if self._free:
             for _ in range(len(self._free)):
@@ -813,6 +818,7 @@ class ClusterNode:
 
         raise ConnectionError("Too many connections")
 
+    @profile
     async def parse_response(
         self, connection: Connection, command: str, **kwargs: Any
     ) -> Any:
@@ -850,6 +856,7 @@ class ClusterNode:
             # Release connection
             self._free.append(connection)
 
+    @profile
     async def execute_pipeline(self) -> bool:
         # Acquire connection
         connection = self.acquire_connection()
@@ -983,6 +990,7 @@ class NodesManager:
         # Reset moved_exception
         self._moved_exception = None
 
+    @profile
     def get_node_from_slot(
         self, slot: int, read_from_replicas: bool = False
     ) -> "ClusterNode":
@@ -1202,6 +1210,7 @@ class ClusterPipeline(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterComm
 
     __slots__ = ("_command_stack", "_client")
 
+    @profile
     def __init__(self, client: RedisCluster) -> None:
         self._client = client
 
@@ -1222,10 +1231,12 @@ class ClusterPipeline(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterComm
     def __await__(self) -> Generator[Any, None, "ClusterPipeline"]:
         return self.initialize().__await__()
 
+    @profile
     def __enter__(self) -> "ClusterPipeline":
         self._command_stack = []
         return self
 
+    @profile
     def __exit__(self, exc_type: None, exc_value: None, traceback: None) -> None:
         self._command_stack = []
 
@@ -1235,6 +1246,7 @@ class ClusterPipeline(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterComm
     def __len__(self) -> int:
         return len(self._command_stack)
 
+    @profile
     def execute_command(
         self, *args: Union[KeyT, EncodableT], **kwargs: Any
     ) -> "ClusterPipeline":
@@ -1254,6 +1266,7 @@ class ClusterPipeline(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterComm
         )
         return self
 
+    @profile
     async def execute(
         self, raise_on_error: bool = True, allow_redirections: bool = True
     ) -> List[Any]:
@@ -1302,6 +1315,7 @@ class ClusterPipeline(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterComm
         finally:
             self._command_stack = []
 
+    @profile
     async def _execute(
         self,
         client: "RedisCluster",
@@ -1392,6 +1406,7 @@ for command in PIPELINE_BLOCKED_COMMANDS:
 
 
 class PipelineCommand:
+    @profile
     def __init__(self, position: int, *args: Any, **kwargs: Any) -> None:
         self.args = args
         self.kwargs = kwargs
